@@ -87,6 +87,7 @@ main{max-width:896px;margin:0 auto;width:100%;flex:1;padding:24px 16px}
 .icon-btn{padding:8px}
 svg.ic{width:16px;height:16px;flex:none}
 svg.ic-lg{width:20px;height:20px;flex:none}
+svg.ic-wm{width:96px;height:96px}
 /* ---------- Бейджи статуса ---------- */
 .badge{display:inline-flex;align-items:center;border-radius:4px;padding:2px 8px;font-size:12px;font-weight:600;line-height:1.4;white-space:nowrap}
 .badge-learned{background:#242e1c;color:var(--green);border:1px solid #3d4a2f}
@@ -242,6 +243,24 @@ const WORDS = DATA.WORDS;
 const DECKS = DATA.DECKS;
 const DECK_MAP = DATA.deckById;
 
+/* ---------------- Пиктограммы слов ----------------
+ * Маленькие «картинки» для карточек и списков: рисуются
+ * системным шрифтом эмодзи, не грузятся из сети и работают
+ * офлайн на любом телефоне. */
+const EMOJI = {
+  1:"📻",2:"🆗",3:"💪",4:"✅",5:"❌",6:"⏸️",7:"🎙️",8:"🔁",9:"👣",10:"🕕",
+  11:"🚶",12:"📍",13:"⏩",14:"⬅️",15:"🚫",16:"🔥",17:"🤐",18:"🔃",19:"🙈",20:"🆘",
+  21:"🚨",22:"💀",23:"🟢",24:"🧹",25:"👀",26:"🎯",27:"🛫",28:"🛬",29:"🏠",30:"🎖️",
+  31:"🔫",32:"📦",33:"📼",34:"🤫",35:"🔭",36:"🏰",37:"🧨",38:"💥",39:"🚪",40:"📸",
+  41:"💨",42:"🦺",43:"🚁",44:"🛸",45:"📡",46:"🚚",47:"⛓️",48:"🕴️",49:"📌",50:"🕵️",
+  51:"🛩️",52:"🌡️",53:"☢️",54:"🚀",55:"🕳️",56:"🏯",57:"🚧",58:"🪤",59:"↗️",60:"🚑",
+  61:"🗡️",62:"🐍",63:"🤥",64:"✍️",65:"☠️",66:"💬",67:"📜",68:"👨‍✈️",69:"💼",70:"👮",
+  71:"❤️‍🩹",72:"🛡️",73:"🤝",74:"😔",75:"🤦",76:"⚖️",77:"🫡",78:"🪖",79:"🏅",80:"🐔",
+  81:"😲",82:"🤬",83:"🙇",84:"⬇️",85:"🧠",86:"🫂",87:"🏃",88:"🛣️",89:"👍",90:"💯",
+  91:"✋",92:"⚠️",93:"🔙",94:"☄️",95:"⌛",96:"🕊️",97:"🛑",98:"👂",99:"🙅",100:"🏁"
+};
+function wEmoji(w) { return EMOJI[w.id] || "🎯"; }
+
 /* ---------------- Иконки (lucide-style) ---------------- */
 const ICONS = {
   crosshair: '<circle cx="12" cy="12" r="10"/><line x1="22" x2="18" y1="12" y2="12"/><line x1="6" x2="2" y1="12" y2="12"/><line x1="12" x2="12" y1="6" y2="2"/><line x1="12" x2="12" y1="22" y2="18"/>',
@@ -340,9 +359,19 @@ function buildQueue(p, words) {
   return hard.concat(done);
 }
 
-/* ---------------- Озвучка (Web Speech API) ---------------- */
+/* ---------------- Озвучка (Web Speech API) ----------------
+ * Три известные причины «звук то есть, то нет» на телефонах:
+ * 1) iOS Safari и Android Chrome не дают говорить, пока движок
+ *    не «разбужен» первым касанием страницы — лечится warm-up
+ *    беззвучной репликой на первом тапе;
+ * 2) Chrome: cancel() в тот же тик перед speak() глушит первую
+ *    озвучку — даём движку 50 мс;
+ * 3) Chrome: сборщик мусора выгружает реплику и обрывает звук —
+ *    держим ссылку currentUtterance. */
 let cachedVoice = null;
 let speechOk = false;
+let ttsUnlocked = false;
+let currentUtterance = null;
 function pickVoice() {
   if (!("speechSynthesis" in window)) return null;
   const voices = window.speechSynthesis.getVoices();
@@ -350,27 +379,44 @@ function pickVoice() {
   return voices.find((v) => v.lang === "en-US" && /google/i.test(v.name)) ||
     voices.find((v) => v.lang === "en-US") ||
     voices.find((v) => v.lang === "en-GB") ||
-    voices.find((v) => (v.lang || "").startsWith("en")) || null;
+    voices.find((v) => (v.lang || "").toLowerCase().indexOf("en") === 0) || null;
 }
 function speak(text, rate) {
-  if (!("speechSynthesis" in window)) return false;
+  if (!("speechSynthesis" in window) || !text) return false;
   try {
+    const synth = window.speechSynthesis;
     if (!cachedVoice) cachedVoice = pickVoice();
     const u = new SpeechSynthesisUtterance(text);
     if (cachedVoice) u.voice = cachedVoice;
     u.lang = (cachedVoice && cachedVoice.lang) || "en-US";
     u.rate = rate || 0.92;
     u.pitch = 1;
-    window.speechSynthesis.cancel();
-    window.speechSynthesis.speak(u);
+    u.volume = 1;
+    currentUtterance = u;
+    synth.cancel();
+    setTimeout(() => { try { synth.speak(u); } catch (e) { /* ignore */ } }, 50);
     return true;
   } catch (e) { return false; }
 }
+/* Разблокировка речи первым касанием/кликом на странице */
+function unlockTTS() {
+  if (ttsUnlocked || !("speechSynthesis" in window)) return;
+  try {
+    const u = new SpeechSynthesisUtterance(" ");
+    u.volume = 0;
+    u.rate = 2;
+    window.speechSynthesis.speak(u);
+    ttsUnlocked = true;
+  } catch (e) { /* ignore */ }
+}
+["pointerdown", "touchend", "keydown", "click"].forEach((ev) => {
+  window.addEventListener(ev, unlockTTS, { passive: true });
+});
 function initSpeech() {
   if (!("speechSynthesis" in window)) return;
   const check = () => {
     const was = speechOk;
-    speechOk = window.speechSynthesis.getVoices().some((v) => (v.lang || "").startsWith("en"));
+    speechOk = window.speechSynthesis.getVoices().some((v) => (v.lang || "").toLowerCase().indexOf("en") === 0);
     if (speechOk !== was && state.view === "home") render();
   };
   check();
@@ -378,6 +424,7 @@ function initSpeech() {
     window.speechSynthesis.addEventListener("voiceschanged", check);
   }
   setTimeout(check, 800);
+  setTimeout(check, 2500); /* на телефонах голоса подгружаются с задержкой */
 }
 
 /* ---------------- Состояние ---------------- */
@@ -428,6 +475,33 @@ function quoteBlock(w, compact) {
   return "";
 }
 
+/* ---------------- Декоративная полоса (тактический HUD) ---------------- */
+function heroSvg() {
+  return '<svg viewBox="0 0 800 70" width="100%" style="display:block;margin-bottom:14px" preserveAspectRatio="xMidYMid meet" aria-hidden="true">' +
+    '<path d="M100 66 H 780" stroke="#1c2228" stroke-width="1"/>' +
+    '<g stroke="#3d4a2f" stroke-width="2" fill="none">' +
+    '<circle cx="34" cy="35" r="22"/><circle cx="34" cy="35" r="11" stroke="#6d8850"/>' +
+    '<line x1="34" y1="4" x2="34" y2="22"/><line x1="34" y1="48" x2="34" y2="66"/>' +
+    '<line x1="3" y1="35" x2="21" y2="35"/><line x1="47" y1="35" x2="65" y2="35"/></g>' +
+    '<path d="M100 35 H 560" stroke="#3d4a2f" stroke-width="1.5" stroke-dasharray="2 7"/>' +
+    '<path d="M240 35 l6 -5 6 5 -6 5z" fill="#0a0d10" stroke="#3d4a2f" stroke-width="1.2"/>' +
+    '<path d="M420 35 l6 -5 6 5 -6 5z" fill="#0a0d10" stroke="#3d4a2f" stroke-width="1.2"/>' +
+    '<g transform="translate(560,8)" fill="#1c2812" stroke="#6d8850" stroke-width="1.2" stroke-linejoin="round">' +
+    '<line x1="4" y1="10" x2="116" y2="10"/><line x1="60" y1="10" x2="60" y2="20"/>' +
+    '<path d="M22 34 q6 -12 34 -13 l26 -1 q14 0 17 8 l2 6 q1 6 -7 6 h-66 q-9 0 -6 -6z"/>' +
+    '<path d="M96 36 l30 -2 -4 -7 -24 1z"/>' +
+    '<line x1="122" y1="24" x2="122" y2="44"/>' +
+    '<line x1="30" y1="47" x2="28" y2="56"/><line x1="78" y1="47" x2="80" y2="56"/>' +
+    '<line x1="18" y1="57" x2="94" y2="57"/></g>' +
+    '<g transform="translate(706,4) scale(0.5)" fill="#10160e" stroke="#3d4a2f" stroke-width="1.6" stroke-linejoin="round">' +
+    '<line x1="4" y1="10" x2="116" y2="10"/><line x1="60" y1="10" x2="60" y2="20"/>' +
+    '<path d="M22 34 q6 -12 34 -13 l26 -1 q14 0 17 8 l2 6 q1 6 -7 6 h-66 q-9 0 -6 -6z"/>' +
+    '<path d="M96 36 l30 -2 -4 -7 -24 1z"/>' +
+    '<line x1="122" y1="24" x2="122" y2="44"/></g>' +
+    '<text x="120" y="60" font-size="9" letter-spacing="3" fill="#3d4a2f" font-family="monospace">GRID 84.02 // ALT 1200 FT // TF-141</text>' +
+    "</svg>";
+}
+
 /* ---------------- Главная ---------------- */
 function renderHome() {
   const overall = deckStats(state.progress, WORDS);
@@ -438,6 +512,7 @@ function renderHome() {
 
   // Сводка
   html += '<div class="card tac-corners" style="padding:24px">' +
+    heroSvg() +
     '<div style="display:flex;flex-wrap:wrap;align-items:flex-start;justify-content:space-between;gap:16px">' +
     "<div><p class=\"overline green\" style=\"margin:0 0 4px\">Task Force 141 // English</p>" +
     '<h1 class="tac-heading" style="margin:0;font-size:26px">Тренажёр слов</h1>' +
@@ -462,8 +537,9 @@ function renderHome() {
     ).join("") +
     '</div><label style="display:flex;align-items:center;gap:10px;cursor:pointer;user-select:none">' +
     '<span class="switch"><input type="checkbox" data-setting="autoSpeak"' + (s.autoSpeak ? " checked" : "") + ' aria-label="Автоозвучка слова"><span class="track"></span></span>' +
-    '<span style="display:flex;align-items:center;gap:6px;font-size:14px;color:var(--muted-fg)">' + icon("volume") + " Автоозвучка слова</span></label></div>" +
-    (!speechOk ? '<p style="margin:12px 0 0"><span style="display:inline-flex;align-items:center;gap:4px;font-size:12px;color:var(--muted-fg)">' + icon("volx") + " английский голос недоступен в этом браузере</span></p>" : "") +
+    '<span style="display:flex;align-items:center;gap:6px;font-size:14px;color:var(--muted-fg)">' + icon("volume") + " Автоозвучка слова</span></label>" +
+    '<button class="btn btn-outline" data-action="test-sound" style="font-size:13px;padding:8px 14px">🔊 Проверить звук</button></div>' +
+    (!speechOk ? '<p style="margin:12px 0 0"><span style="display:inline-flex;align-items:center;gap:4px;font-size:12px;color:var(--muted-fg)">' + icon("volx") + " английский голос недоступен здесь — открой страницу в Chrome (Android) или Safari (iPhone)</span></p>" : "") +
     "</div>";
 
   // Колоды
@@ -473,7 +549,8 @@ function renderHome() {
     const words = WORDS.filter((w) => w.deck === d.id);
     const st = deckStats(state.progress, words);
     const p = Math.round((st.learned / st.total) * 100);
-    html += '<div class="card" style="padding:20px;transition:border-color .15s" onmouseover="this.style.borderColor=\'#3d4a2f\'" onmouseout="this.style.borderColor=\'var(--border)\'">' +
+    html += '<div class="card" style="padding:20px;position:relative;overflow:hidden;transition:border-color .15s" onmouseover="this.style.borderColor=\'#3d4a2f\'" onmouseout="this.style.borderColor=\'var(--border)\'">' +
+      '<span style="position:absolute;right:-10px;bottom:-16px;opacity:.09;color:#b9d478;pointer-events:none">' + icon(deckIcons[d.id], "ic-wm") + "</span>" +
       '<div style="display:flex;align-items:flex-start;justify-content:space-between;gap:12px">' +
       '<div class="deck-grid" style="align-items:center">' +
       '<div style="width:44px;height:44px;flex:none;display:flex;align-items:center;justify-content:center;border:1px solid #3d4a2f;background:#161c13;color:#a3b869;border-radius:4px">' + icon(deckIcons[d.id], "ic-lg") + "</div>" +
@@ -516,6 +593,15 @@ function autospeakCurrent() {
   if (!s || s.summary) return;
   const w = currentWord();
   if (w && state.settings.autoSpeak && s.cardDir === "en-ru") speak(w.speak || w.en);
+}
+/* В режиме RU→EN английское слово появляется только на обороте —
+ * озвучиваем его в момент переворота карточки. */
+function autospeakOnFlip() {
+  const s = state.session;
+  if (!s || s.summary || !state.settings.autoSpeak) return;
+  if (s.cardDir !== "ru-en") return; /* в EN→RU слово уже прозвучало при показе */
+  const w = currentWord();
+  if (w) speak(w.speak || w.en);
 }
 function answer(correct) {
   const s = state.session;
@@ -568,11 +654,12 @@ function renderSession() {
     const answered = s.right + s.wrong;
     const pct = answered > 0 ? Math.round((s.right / answered) * 100) : 0;
     let html = '<div class="stack tac-fade-up">';
+    const rank = pct === 100 ? ["🏆", "Легенда"] : pct >= 80 ? ["🎖️", "Ветеран"] : pct >= 60 ? ["🫡", "Боец"] : pct >= 40 ? ["😬", "Новобранец"] : ["💀", "Учебка"];
     html += '<div class="card tac-corners" style="padding:32px 24px;text-align:center">' +
       '<div style="display:flex;justify-content:center;margin-bottom:16px">' +
-      '<div style="width:64px;height:64px;display:flex;align-items:center;justify-content:center;border-radius:9999px;border:2px solid #3d4a2f;background:#161c13;color:var(--green)">' + icon("trophy", "ic-lg") + "</div></div>" +
+      '<div style="width:64px;height:64px;display:flex;align-items:center;justify-content:center;border-radius:9999px;border:2px solid #3d4a2f;background:#161c13;font-size:28px" aria-hidden="true">' + rank[0] + "</div></div>" +
       '<h2 class="tac-heading" style="margin:0;font-size:22px">Тренировка завершена</h2>' +
-      '<p class="muted" style="margin:4px 0 0;font-size:14px">' + esc(s.deckLabel) + "</p>" +
+      '<p class="muted" style="margin:4px 0 0;font-size:14px">' + esc(s.deckLabel) + " · ранг: " + rank[1] + "</p>" +
       '<div style="margin-top:24px;display:flex;align-items:center;justify-content:center;gap:32px">' +
       '<div><div style="font-size:36px;font-weight:700;color:var(--green);font-variant-numeric:tabular-nums">' + pct + "%</div>" +
       '<div style="font-size:12px;color:var(--muted-fg);margin-top:4px">точность</div></div>' +
@@ -584,7 +671,7 @@ function renderSession() {
       html += '<div class="card" style="padding:20px"><p class="overline" style="margin:0 0 12px">Слова с ошибками — повтори (' + s.mistakes.length + ")</p>";
       for (const m of s.mistakes) {
         html += '<div class="mini-row"><div style="min-width:0;flex:1">' +
-          '<div style="font-weight:600;color:#d5d9c9;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(m.en) + "</div>" +
+          '<div style="font-weight:600;color:#d5d9c9;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + wEmoji(m) + " " + esc(m.en) + "</div>" +
           '<div style="font-size:12px;color:var(--muted-fg);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(m.ru) + "</div></div>" +
           speakBtn(m.speak || m.en) + "</div>";
       }
@@ -626,7 +713,8 @@ function renderSession() {
 
   // лицевая сторона
   html += '<div class="flip-face"><div class="card tac-corners face-front">' +
-    '<p style="margin:0 0 16px;font-size:10px;text-transform:uppercase;letter-spacing:.22em;color:#5a626a">' + esc(sub) + "</p>" +
+    '<p style="margin:0 0 10px;font-size:10px;text-transform:uppercase;letter-spacing:.22em;color:#5a626a">' + esc(sub) + "</p>" +
+    '<div style="font-size:clamp(30px,8vw,42px);line-height:1;margin-bottom:12px" aria-hidden="true">' + wEmoji(w) + "</div>" +
     '<p class="word">' + esc(frontText) + "</p>" +
     '<div style="margin-top:24px">' + (frontIsEn ? speakBtn(w.speak || w.en) : "") + "</div>" +
     '<p class="hint" style="margin:24px 0 0">нажми на карточку или Space — перевернуть</p></div></div>';
@@ -634,7 +722,7 @@ function renderSession() {
   // оборот
   html += '<div class="flip-face back"><div class="card tac-corners face-back">' +
     '<div style="display:flex;align-items:flex-start;justify-content:space-between;gap:12px">' +
-    '<div style="min-width:0"><p class="word-sm" style="margin:0">' + esc(w.en) + "</p>" +
+    '<div style="min-width:0"><p class="word-sm" style="margin:0;display:flex;align-items:center;gap:6px"><span style="font-size:15px;letter-spacing:0">' + wEmoji(w) + "</span>" + esc(w.en) + "</p>" +
     '<p class="word-big">' + esc(w.ru) + "</p></div>" +
     speakBtn(w.speak || w.en) + "</div>" +
     '<p style="margin:12px 0 0;font-size:14px;line-height:1.6;color:#9aa1a8">' + esc(w.note) + "</p>" +
@@ -694,7 +782,7 @@ function renderDict() {
     html += '<div class="row-item" data-row data-deck="' + w.deck + '" data-status="' + wordStatus(state.progress, w.id) + '" data-en="' + esc(w.en.toLowerCase()) + '" data-ru="' + esc(w.ru.toLowerCase()) + '">' +
       '<button class="row-head" data-action="dict-toggle" data-id="' + w.id + '" aria-expanded="' + (open ? "true" : "false") + '">' +
       '<span class="row-num">' + String(w.id).padStart(2, "0") + "</span>" +
-      '<span class="row-en">' + esc(w.en) + "</span>" +
+      '<span class="row-en">' + wEmoji(w) + " " + esc(w.en) + "</span>" +
       '<span class="row-ru">' + esc(w.ru) + "</span>" +
       statusBadge(wordStatus(state.progress, w.id)) +
       '<span class="chev' + (open ? " open" : "") + '">' + icon("chevdown") + "</span></button>";
@@ -822,6 +910,7 @@ function render() {
       if (!s || s.summary) return;
       s.flipped = !s.flipped;
       fc.classList.toggle("flipped", s.flipped);
+      if (s.flipped) autospeakOnFlip();
       // перерисовываем кнопки ответа
       const know = document.querySelector('[data-action="know"]');
       const dont = document.querySelector('[data-action="dontknow"]');
@@ -859,6 +948,7 @@ document.getElementById("app").addEventListener("click", (e) => {
   }
   if (act === "start-deck") { startSession(el.getAttribute("data-deck")); render(); return; }
   if (act === "dir") { state.settings.direction = el.getAttribute("data-dir"); lsSet(SETTINGS_KEY, state.settings); render(); return; }
+  if (act === "test-sound") { speak("Copy that. Moving now."); return; }
   if (act === "know") { answer(true); return; }
   if (act === "dontknow") { answer(false); return; }
   if (act === "redo-mistakes") { restartSession(state.session.mistakes.slice()); return; }
@@ -929,6 +1019,7 @@ window.addEventListener("keydown", (e) => {
     e.preventDefault();
     if (!s.flipped) {
       s.flipped = true;
+      autospeakOnFlip();
       const fc = document.getElementById("flipCard");
       if (fc) {
         fc.classList.add("flipped");
