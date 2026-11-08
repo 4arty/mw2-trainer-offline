@@ -364,14 +364,16 @@ function buildQueue(p, words) {
  * 1) iOS Safari и Android Chrome не дают говорить, пока движок
  *    не «разбужен» первым касанием страницы — лечится warm-up
  *    беззвучной репликой на первом тапе;
- * 2) Chrome: cancel() в тот же тик перед speak() глушит первую
- *    озвучку — даём движку 50 мс;
+ * 2) Chrome: cancel() в тот же тик перед speak() глушит озвучку —
+ *    пауза только когда что-то уже играет, иначе говорим сразу;
  * 3) Chrome: сборщик мусора выгружает реплику и обрывает звук —
  *    держим ссылку currentUtterance. */
 let cachedVoice = null;
 let speechOk = false;
 let ttsUnlocked = false;
 let currentUtterance = null;
+let speechStarted = false;  /* onstart последней реплики */
+let speechLastError = null; /* not-allowed, synthesis-failed… */
 function pickVoice() {
   if (!("speechSynthesis" in window)) return null;
   const voices = window.speechSynthesis.getVoices();
@@ -380,6 +382,15 @@ function pickVoice() {
     voices.find((v) => v.lang === "en-US") ||
     voices.find((v) => v.lang === "en-GB") ||
     voices.find((v) => (v.lang || "").toLowerCase().indexOf("en") === 0) || null;
+}
+function refreshVoices() {
+  if (!("speechSynthesis" in window)) return 0;
+  const voices = window.speechSynthesis.getVoices();
+  const was = speechOk;
+  speechOk = voices.some((v) => (v.lang || "").toLowerCase().indexOf("en") === 0);
+  if (!cachedVoice) cachedVoice = pickVoice();
+  if (speechOk !== was && state.view === "home") render();
+  return voices.length;
 }
 function speak(text, rate) {
   if (!("speechSynthesis" in window) || !text) return false;
@@ -393,38 +404,94 @@ function speak(text, rate) {
     u.pitch = 1;
     u.volume = 1;
     currentUtterance = u;
-    synth.cancel();
-    setTimeout(() => { try { synth.speak(u); } catch (e) { /* ignore */ } }, 50);
+    speechStarted = false;
+    u.onstart = () => { speechStarted = true; speechLastError = null; };
+    u.onerror = (ev) => {
+      if (ev && ev.error && ev.error !== "interrupted" && ev.error !== "canceled") speechLastError = ev.error;
+    };
+    if (synth.paused) { try { synth.resume(); } catch (e) { /* ignore */ } }
+    /* Android Chrome: cancel() в тот же тик глушит speak(). Если движок
+     * молчит — говорим СРАЗУ, внутри жеста (первый тап по деке/кнопке);
+    * пауза нужна только когда что-то уже играет. */
+    if (synth.speaking || synth.pending) {
+      synth.cancel();
+      setTimeout(() => { try { synth.speak(u); } catch (e) { speechLastError = e && e.message; } }, 90);
+    } else {
+      synth.speak(u);
+    }
     return true;
-  } catch (e) { return false; }
+  } catch (e) { speechLastError = e && e.message; return false; }
 }
 /* Разблокировка речи первым касанием/кликом на странице */
 function unlockTTS() {
   if (ttsUnlocked || !("speechSynthesis" in window)) return;
+  ttsUnlocked = true;
   try {
     const u = new SpeechSynthesisUtterance(" ");
     u.volume = 0;
     u.rate = 2;
     window.speechSynthesis.speak(u);
-    ttsUnlocked = true;
   } catch (e) { /* ignore */ }
+  setTimeout(refreshVoices, 300); /* на Android голоса появляются после первого speak */
 }
 ["pointerdown", "touchend", "keydown", "click"].forEach((ev) => {
   window.addEventListener(ev, unlockTTS, { passive: true });
 });
 function initSpeech() {
   if (!("speechSynthesis" in window)) return;
-  const check = () => {
-    const was = speechOk;
-    speechOk = window.speechSynthesis.getVoices().some((v) => (v.lang || "").toLowerCase().indexOf("en") === 0);
-    if (speechOk !== was && state.view === "home") render();
-  };
-  check();
+  refreshVoices();
   if (typeof window.speechSynthesis.addEventListener === "function") {
-    window.speechSynthesis.addEventListener("voiceschanged", check);
+    window.speechSynthesis.addEventListener("voiceschanged", refreshVoices);
   }
-  setTimeout(check, 800);
-  setTimeout(check, 2500); /* на телефонах голоса подгружаются с задержкой */
+  /* на телефонах голоса подгружаются с задержкой — опрашиваем несколько раз */
+  [500, 1200, 2500, 5000].forEach((ms) => setTimeout(refreshVoices, ms));
+}
+
+/* ---------------- Диагностика звука ---------------- */
+function soundStatusRows() {
+  const has = "speechSynthesis" in window;
+  let voices = [];
+  try { voices = has ? window.speechSynthesis.getVoices() : []; } catch (e) { /* ignore */ }
+  const en = voices.find((v) => (v.lang || "").toLowerCase().indexOf("en") === 0);
+  const row = (label, val, color) =>
+    '<div style="display:flex;justify-content:space-between;gap:12px;font-size:13px;padding:7px 0;border-bottom:1px dashed var(--border)">' +
+    "<span>" + label + "</span><span style=\"font-weight:600;text-align:right;color:" + (color || "#e8e6e0") + "\">" + val + "</span></div>";
+  let html = "";
+  html += row("Движок речи (TTS)", has ? "есть" : "нет в этом браузере", has ? "var(--green)" : "var(--red)");
+  html += row("Голосов загружено", has ? String(voices.length) : "—");
+  html += row("Английский голос", en ? esc(en.name) : speechOk ? "есть" : "не найден", en || speechOk ? "var(--green)" : "var(--red)");
+  const errMap = {
+    "not-allowed": "браузер заблокировал речь — коснись страницы и попробуй ещё раз",
+    "synthesis-failed": "системный синтезатор речи дал сбой",
+    "synthesis-unavailable": "системный синтезатор речи недоступен",
+    "language-unavailable": "в системе не установлен английский голос",
+    "voice-unavailable": "выбранный голос недоступен",
+    "audio-busy": "аудиосистема телефона занята другим приложением",
+    "network": "голосу нужен интернет, а его нет",
+  };
+  if (speechLastError) {
+    html += row("Последняя ошибка", esc(errMap[speechLastError] || speechLastError), "var(--red)");
+  } else if (speechStarted) {
+    html += row("Последняя проверка", "реплика запущена — если слышно, всё ок", "var(--green)");
+  }
+  return html;
+}
+function showSoundModal() {
+  document.getElementById("modal-root").innerHTML =
+    '<div class="overlay"><div class="dialog" role="dialog" aria-modal="true">' +
+    "<h2>Нет звука? Давай разберёмся</h2>" +
+    '<div style="margin:0 0 16px">' + soundStatusRows() + "</div>" +
+    '<div style="display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap">' +
+    '<button class="btn btn-primary" data-action="test-sound" style="flex:1">🔊 Проверить звук</button>' +
+    '<button class="btn btn-outline" data-action="hide-sound">Закрыть</button></div>' +
+    '<p style="margin:0 0 8px;font-size:14px;font-weight:600">Chrome на Android берёт системный синтезатор речи. Если тест молчит — по порядку:</p>' +
+    '<ol style="margin:0;padding-left:20px;font-size:13px;color:var(--muted-fg);line-height:1.7">' +
+    "<li>Во время проверки нажми качелку громкости — на телефонах отдельно регулируется «мультимедиа».</li>" +
+    "<li><b>Настройки Android → Синтез речи</b> (в разделе «Языки и ввод» или «Спец. возможности»): движок — <b>Google Текст-в-речь</b>, язык — English. Если голосовой пакет не скачан — скачай английский.</li>" +
+    "<li>Открывай ссылку прямо в <b>Chrome</b>, а не во встроенном браузере Telegram/WhatsApp — там речь часто заглушена.</li>" +
+    "<li>Chrome → ⋮ → Настройки → Настройки сайтов → Звук: этот сайт не должен быть в списке заблокированных.</li>" +
+    "<li>После смены настроек полностью закрой вкладку и открой страницу заново.</li>" +
+    "</ol></div></div>";
 }
 
 /* ---------------- Состояние ---------------- */
@@ -539,7 +606,8 @@ function renderHome() {
     '<span class="switch"><input type="checkbox" data-setting="autoSpeak"' + (s.autoSpeak ? " checked" : "") + ' aria-label="Автоозвучка слова"><span class="track"></span></span>' +
     '<span style="display:flex;align-items:center;gap:6px;font-size:14px;color:var(--muted-fg)">' + icon("volume") + " Автоозвучка слова</span></label>" +
     '<button class="btn btn-outline" data-action="test-sound" style="font-size:13px;padding:8px 14px">🔊 Проверить звук</button></div>' +
-    (!speechOk ? '<p style="margin:12px 0 0"><span style="display:inline-flex;align-items:center;gap:4px;font-size:12px;color:var(--muted-fg)">' + icon("volx") + " английский голос недоступен здесь — открой страницу в Chrome (Android) или Safari (iPhone)</span></p>" : "") +
+    (!speechOk ? '<div style="margin-top:14px;display:flex;align-items:center;gap:10px;flex-wrap:wrap"><span style="display:inline-flex;align-items:center;gap:4px;font-size:12px;color:var(--amber)">' + icon("volx") + " английский голос не найден в системе</span>" +
+      '<button class="btn btn-outline" data-action="show-sound" style="font-size:12px;padding:6px 10px">Что делать?</button></div>' : "") +
     "</div>";
 
   // Колоды
@@ -558,6 +626,11 @@ function renderHome() {
       '<p style="margin:2px 0 0;font-size:10px;text-transform:uppercase;letter-spacing:.16em;color:#5a626a">' + esc(d.subtitle) + " · " + st.total + " слов</p></div></div>" +
       '<span style="font-size:18px;font-weight:700;color:var(--green);font-variant-numeric:tabular-nums">' + p + "%</span></div>" +
       '<p class="muted" style="margin:12px 0 0;font-size:14px;line-height:1.6">' + esc(d.description) + "</p>" +
+      '<div style="margin-top:14px;display:flex;gap:6px;flex-wrap:wrap;align-items:center">' +
+      words.slice(0, 4).map((w) =>
+        '<span title="' + esc(w.en) + '" style="width:36px;height:36px;display:flex;align-items:center;justify-content:center;border:1px solid var(--border);border-radius:4px;background:#10141a;font-size:18px">' + wEmoji(w) + "</span>"
+      ).join("") +
+      '<span style="font-size:11px;color:#5a626a">и ещё ' + (st.total - 4) + "</span></div>" +
       '<div style="margin-top:16px">' + progBar(p, 6) + '<div style="margin-top:10px">' + dotsHtml(st) + "</div></div>" +
       '<button class="btn btn-deck btn-block" data-action="start-deck" data-deck="' + d.id + '" style="margin-top:16px">Тренировать ' + icon("arrowr") + "</button></div>";
   }
@@ -948,7 +1021,18 @@ document.getElementById("app").addEventListener("click", (e) => {
   }
   if (act === "start-deck") { startSession(el.getAttribute("data-deck")); render(); return; }
   if (act === "dir") { state.settings.direction = el.getAttribute("data-dir"); lsSet(SETTINGS_KEY, state.settings); render(); return; }
-  if (act === "test-sound") { speak("Copy that. Moving now."); return; }
+  if (act === "test-sound") {
+    speechStarted = false;
+    const modalWasOpen = !!document.querySelector("#modal-root .dialog");
+    speak("Copy that. Moving now.");
+    /* если через 1.8 с движок так и не заговорил — открываем диагностику */
+    setTimeout(() => {
+      if (speechStarted) { if (modalWasOpen) showSoundModal(); }
+      else showSoundModal();
+    }, 1800);
+    return;
+  }
+  if (act === "show-sound") { showSoundModal(); return; }
   if (act === "know") { answer(true); return; }
   if (act === "dontknow") { answer(false); return; }
   if (act === "redo-mistakes") { restartSession(state.session.mistakes.slice()); return; }
@@ -971,6 +1055,13 @@ document.getElementById("modal-root").addEventListener("click", (e) => {
   const el = e.target.closest("[data-action]");
   if (!el) return;
   const act = el.getAttribute("data-action");
+  if (act === "test-sound") {
+    speechStarted = false;
+    speak("Copy that. Moving now.");
+    setTimeout(() => { if (document.querySelector("#modal-root .dialog")) showSoundModal(); }, 1800);
+    return;
+  }
+  if (act === "hide-sound") { hideResetModal(); return; }
   if (act === "cancel-reset") hideResetModal();
   else if (act === "confirm-reset") {
     try { localStorage.removeItem(PROGRESS_KEY); localStorage.removeItem(HISTORY_KEY); } catch (err) {}
